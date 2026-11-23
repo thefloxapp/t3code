@@ -144,7 +144,10 @@ A run is never folded or replaced when cancelling it would change more than its 
 a leading command, fresh context, a different model, or a delegated task, continuation or plan it
 carries. A digest has no single sender, so it drops the sender fields and the sender note.
 
-Known costs: `t3_thread_wait` on a folded or replaced run reports `cancelled`. A scheduled task
+A digest run starts after every run it folded, so a folded run's cancel never reads as the thread's
+latest run, and `t3_thread_wait` on a folded run answers with the digest run.
+
+Known costs: `t3_thread_wait` on a replaced run reports `cancelled`. A scheduled task
 folded into another run no longer records that run's outcome. A queued summary from the cap carries
 no pull request stamps, so its pull request parts are not revalidated before delivery.
 

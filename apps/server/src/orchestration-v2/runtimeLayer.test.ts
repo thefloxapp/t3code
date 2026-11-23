@@ -7557,6 +7557,35 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           .map((message) => message.runId),
         [digestRun?.id ?? null, digestRun?.id ?? null],
       );
+
+      // Once the digest finishes, the thread reads as finished, not as a folded run's cancel.
+      assert.isDefined(digestRun);
+      const completedAt = yield* DateTime.now;
+      yield* (yield* EventSink.EventSinkV2).write({
+        events: [
+          {
+            id: EventId.make(`${digestRun.id}-completed`),
+            type: "run.updated",
+            threadId,
+            runId: digestRun.id,
+            ...(digestRun.rootNodeId === null ? {} : { nodeId: digestRun.rootNodeId }),
+            providerInstanceId: digestRun.providerInstanceId,
+            occurredAt: completedAt,
+            payload: { ...digestRun, status: "completed", completedAt },
+          },
+        ],
+      });
+      const finished = yield* orchestrator.getThreadProjection(threadId);
+      const latest = ThreadManagementService.latestRun(finished);
+      assert.deepEqual([latest?.id, latest?.status], [digestRun.id, "completed"]);
+      // A wait on a folded run answers with the run that delivered its message.
+      const waited = yield* (yield* ThreadManagementService.ThreadManagementService).waitForThread({
+        projectId: ProjectId.make(`${threadId}-project`),
+        threadId,
+        runId: runOf(wakeId)!.id,
+        timeoutMs: 1,
+      });
+      assert.deepEqual([waited.run?.id, waited.run?.status], [digestRun.id, "completed"]);
     }),
   );
 

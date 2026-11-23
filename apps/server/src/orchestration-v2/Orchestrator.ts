@@ -2952,7 +2952,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           turnItemTypes: ["user_message", "notification"],
           turnItemRunIds: newerRunIds,
         })).turnItems.length > 0;
-      const ordinal = startedAhead ? nextRunOrdinal(projection) : queuedRun.ordinal;
+      const absorbedRuns =
+        options?.queuedRunId === undefined ? automaticRunsBehind(projection, storedQueuedRun) : [];
+      // A digest also moves after the runs it folded, so no folded run reads as the latest one.
+      const ordinal =
+        startedAhead || absorbedRuns.length > 0 || queuedMessage?.automaticDigest !== undefined
+          ? nextRunOrdinal(projection)
+          : queuedRun.ordinal;
       const commandId = CommandId.make(`command:system:start-queued:${queuedRun.id}`);
       const rootNodeId = queuedRun.rootNodeId;
       const attemptId = queuedRun.activeAttemptId;
@@ -3004,15 +3010,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const now = yield* DateTime.now;
       // Automatic messages that piled up behind a busy turn cost one turn, not one each. The fold
       // commits with the start below, so a hold or a failed start leaves every message queued.
-      const fold =
-        options?.queuedRunId === undefined
-          ? yield* foldAutomaticRuns(
-              projection,
-              storedQueuedRun,
-              automaticRunsBehind(projection, storedQueuedRun),
-              now,
-            )
-          : undefined;
+      const fold = yield* foldAutomaticRuns(projection, storedQueuedRun, absorbedRuns, now);
       const deliveredMessage = fold?.message ?? queuedMessage;
       const targetAdapter = yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
         Effect.mapError(

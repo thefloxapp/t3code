@@ -1006,10 +1006,22 @@ const make = Effect.gen(function* () {
       .getThreadEventSequence(input.threadId)
       .pipe(Effect.mapError(loadError));
     const target = yield* getProjectThreadRecords(input, ["runs"]);
-    const selectedRun =
+    const requestedRun =
       input.runId === undefined
         ? latestRun(target)
         : target.runs.find((candidate) => candidate.id === input.runId);
+    // A run cancelled before it started whose message moved on (folded into a digest, or
+    // steered into a live turn) is answered by the run that delivered that message.
+    const movedTo =
+      requestedRun?.status === "cancelled" && requestedRun.startedAt === null
+        ? (yield* getProjectThreadRecords(input, ["messages"], {
+            messageIds: [requestedRun.userMessageId],
+          })).messages[0]?.runId
+        : undefined;
+    const selectedRun =
+      (movedTo == null || movedTo === requestedRun?.id
+        ? undefined
+        : target.runs.find((candidate) => candidate.id === movedTo)) ?? requestedRun;
     if (input.runId !== undefined && selectedRun === undefined) {
       return yield* new ThreadManagementRunNotFoundError({
         threadId: input.threadId,
