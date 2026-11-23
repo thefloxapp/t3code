@@ -1438,6 +1438,8 @@ export const OrchestrationV2ConversationMessage = Schema.Struct({
   senderThreadId: Schema.optional(ThreadId),
   linkedSender: Schema.optional(OrchestrationV2LinkedSender),
   idleCompaction: Schema.optional(OrchestrationV2IdleCompaction),
+  /** Automatic messages a busy thread received, folded into this one so they cost one turn. */
+  automaticDigest: Schema.optional(Schema.Struct({ messages: PositiveInt })),
   /**
    * The message is the script a provider-native workflow run executes, not prose. Clients show
    * the workflow's opening instead and keep the script behind a disclosure.

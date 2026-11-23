@@ -1826,16 +1826,20 @@ it.effect("delivers agent messages queued behind /compact before a later one ste
       yield* Fiber.join(alphaRunning);
       yield* lock;
       assert.deepEqual(
-        started.map((turn) => turn.message.text.split("\n").at(-1)),
-        ["first", "/compact", "ALPHA"],
+        started.slice(0, 2).map((turn) => turn.message.text.split("\n").at(-1)),
+        ["first", "/compact"],
       );
+      // Both queued sends reach the agent in one turn, in send order.
+      const digest = started[2]?.message.text ?? "";
+      assert.isAbove(digest.indexOf("ALPHA"), -1);
+      assert.isBelow(digest.indexOf("ALPHA"), digest.indexOf("BRAVO"));
 
       yield* sendFromAgent("CHARLIE");
       const delivered = [...steered, ...started.slice(3).map((turn) => turn.message.text)]
         .map((text) => text.split("\n").at(-1))
         .filter((text) => text === "BRAVO" || text === "CHARLIE");
-      // Whatever reaches the agent so far does so in send order: CHARLIE never before BRAVO.
-      assert.deepEqual(delivered, ["BRAVO", "CHARLIE"].slice(0, delivered.length));
+      // BRAVO already arrived, so nothing later repeats it.
+      assert.deepEqual(delivered, ["CHARLIE"].slice(0, delivered.length));
     }).pipe(Effect.provide(layer));
   }),
 );

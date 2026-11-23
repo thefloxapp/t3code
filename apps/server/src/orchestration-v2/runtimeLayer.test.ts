@@ -7377,6 +7377,171 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  /** Ends the thread's active run the way its provider would, then waits for the next start. */
+  const finishActiveRun = Effect.fnUntraced(function* (threadId: ThreadId) {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const eventSink = yield* EventSink.EventSinkV2;
+    const activeRun = (yield* orchestrator.getThreadProjection(threadId)).runs.find(
+      (run) => run.status === "starting",
+    );
+    assert.isDefined(activeRun);
+    const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+    const completedAt = yield* DateTime.now;
+    yield* eventSink.write({
+      events: [
+        {
+          id: EventId.make(`${activeRun.id}-completed`),
+          type: "run.updated",
+          threadId,
+          runId: activeRun.id,
+          ...(activeRun.rootNodeId === null ? {} : { nodeId: activeRun.rootNodeId }),
+          providerInstanceId: activeRun.providerInstanceId,
+          occurredAt: completedAt,
+          payload: { ...activeRun, status: "completed", completedAt },
+        },
+      ],
+    });
+    yield* eventSink.stream({ threadId, afterSequence }).pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "run.updated" && stored.event.payload.status === "starting",
+      ),
+      Stream.take(1),
+      Stream.runDrain,
+    );
+    return yield* orchestrator.getThreadProjection(threadId);
+  });
+
+  it.effect("delivers automatic messages queued behind a busy turn as one turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, key, watch } = yield* createWatchedThread("digest");
+      const senderThreadId = ThreadId.make("pr-wake-digest-worker");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${senderThreadId}-create`),
+        threadId: senderThreadId,
+        projectId: ProjectId.make(`${threadId}-project`),
+        title: "Worker report",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: process.cwd(),
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}-active`),
+        threadId,
+        messageId: MessageId.make(`${threadId}-active`),
+        text: "Active work",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const reportId = MessageId.make(`${threadId}-report`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "agent",
+        creationSource: "mcp",
+        senderThreadId,
+        commandId: CommandId.make(reportId),
+        threadId,
+        messageId: reportId,
+        text: "Tests pass on the worker branch.",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const wakeId = MessageId.make(`${threadId}-wake`);
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request-watch.sync",
+        commandId: CommandId.make(wakeId),
+        threadId,
+        ...key,
+        startedAt: watch.startedAt,
+        watch: { ...watch, headSha: "abc123", wakes: 1 },
+        wake: {
+          messageId: wakeId,
+          text: "Checks failed on abc123.",
+          notification: {
+            source: { kind: "monitor" },
+            outcome: "failed",
+            summary: "#7: checks failed",
+          },
+        },
+      });
+      const heartbeatId = MessageId.make(`${threadId}-heartbeat`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        scheduledTaskId: ScheduledTaskId.make("heartbeat"),
+        commandId: CommandId.make(heartbeatId),
+        threadId,
+        messageId: heartbeatId,
+        text: "Heartbeat: check the workers.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+      });
+      const userId = MessageId.make(`${threadId}-user`);
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(userId),
+        threadId,
+        messageId: userId,
+        text: "User follow-up",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "queue_after_active" },
+      });
+
+      const after = yield* finishActiveRun(threadId);
+      const runOf = (messageId: MessageId) =>
+        after.runs.find((run) => run.userMessageId === messageId);
+      const digestRun = runOf(reportId);
+      assert.equal(digestRun?.status, "starting");
+      assert.equal(runOf(wakeId)?.status, "cancelled");
+      assert.equal(runOf(heartbeatId)?.status, "cancelled");
+      assert.equal(runOf(userId)?.status, "queued");
+      const digest = after.messages.find((message) => message.id === reportId);
+      assert.deepEqual(digest?.automaticDigest, { messages: 3 });
+      assert.isUndefined(digest?.senderThreadId);
+      const text = digest?.text ?? "";
+      assert.include(text, "3 automatic messages arrived while this thread was busy");
+      assert.include(text, `From the agent in T3 thread "Worker report" (${senderThreadId})`);
+      assert.include(text, "Pull request watch");
+      assert.include(text, 'Scheduled task "heartbeat"');
+      for (const part of [
+        "Tests pass on the worker branch.",
+        "Checks failed on abc123.",
+        "Heartbeat: check the workers.",
+      ]) {
+        assert.include(text, part);
+      }
+      assert.isBelow(text.indexOf("Tests pass"), text.indexOf("Checks failed"));
+      assert.isBelow(text.indexOf("Checks failed"), text.indexOf("Heartbeat"));
+      assert.notInclude(text, "User follow-up");
+      const prompt = after.turnItems.find(
+        (item) => item.type === "user_message" && item.runId === digestRun?.id,
+      );
+      assert.include(prompt?.type === "user_message" ? prompt.text : "", "Heartbeat");
+      // Folded messages travel with the turn that delivered them.
+      assert.deepEqual(
+        after.messages
+          .filter((message) => message.id === wakeId || message.id === heartbeatId)
+          .map((message) => message.runId),
+        [digestRun?.id ?? null, digestRun?.id ?? null],
+      );
+    }),
+  );
+
   it.effect.each(["open", "merged", "closed", "closed notice", "reopened"] as const)(
     "revalidates a pull-request wake before idle dispatch: %s",
     (mode) =>

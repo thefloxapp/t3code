@@ -194,6 +194,11 @@ import * as RunExecutionService from "./RunExecutionService.ts";
 import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
+import {
+  automaticDigest,
+  automaticDigestLabel,
+  isFoldableAutomaticMessage,
+} from "./AutomaticDelivery.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
   endOrphanedNativeSubagent,
@@ -1211,6 +1216,47 @@ function currentPullRequestWatchWake(
 
 function withoutSection({ section: _, ...stamp }: MonitorPullRequestStamp) {
   return stamp;
+}
+
+const modelSelectionKey = (selection: ModelSelection) =>
+  JSON.stringify([selection.instanceId, selection.model, selection.options ?? null]);
+
+function foldableQueuedMessage(
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "messages">,
+  run: OrchestrationV2Run,
+): OrchestrationV2ConversationMessage | undefined {
+  const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+  return message !== undefined &&
+    isFoldableAutomaticMessage(message, run) &&
+    !isStalePullRequestWatchWake(projection, run) &&
+    currentPullRequestWatchWake(projection, run) === undefined
+    ? message
+    : undefined;
+}
+
+/**
+ * The automatic runs waiting directly behind `head` that can share its turn: each runs on the
+ * same model and changes nothing but the prompt. Held runs wait for the user and are passed over.
+ */
+function automaticRunsBehind(
+  projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
+  head: OrchestrationV2Run,
+): ReadonlyArray<OrchestrationV2Run> {
+  if (foldableQueuedMessage(projection, head) === undefined) return [];
+  const selection = modelSelectionKey(queuedRunModelSelection(projection, head));
+  const order = queuedRunsInDeliveryOrder(projection);
+  const behind: Array<OrchestrationV2Run> = [];
+  for (const run of order.slice(order.findIndex((candidate) => candidate.id === head.id) + 1)) {
+    if (run.queueHeld === true) continue;
+    if (
+      foldableQueuedMessage(projection, run) === undefined ||
+      modelSelectionKey(queuedRunModelSelection(projection, run)) !== selection
+    ) {
+      break;
+    }
+    behind.push(run);
+  }
+  return behind;
 }
 
 function queuedRunCancellationEvents(
@@ -2452,6 +2498,99 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return true;
   });
 
+  /**
+   * Folds `absorbed` into `head` so the provider reads them in one turn. The absorbed runs are
+   * cancelled and their messages move to `head`, whose prompt lists every message.
+   */
+  const foldAutomaticRuns = Effect.fnUntraced(function* (
+    projection: Pick<OrchestrationV2ThreadProjection, "messages" | "nodes" | "attempts">,
+    head: OrchestrationV2Run,
+    absorbed: ReadonlyArray<OrchestrationV2Run>,
+    now: DateTime.Utc,
+  ) {
+    const messageOf = (run: OrchestrationV2Run) =>
+      projection.messages.find((message) => message.id === run.userMessageId);
+    const headMessage = messageOf(head);
+    const messages = [headMessage, ...absorbed.map(messageOf)].filter(
+      (message): message is OrchestrationV2ConversationMessage => message !== undefined,
+    );
+    if (
+      absorbed.length === 0 ||
+      headMessage === undefined ||
+      messages.length !== absorbed.length + 1
+    ) {
+      return undefined;
+    }
+    const items = yield* Effect.forEach(messages, (message) =>
+      (message.senderThreadId === undefined
+        ? Effect.succeed(null)
+        : projectionStore.findThread(message.senderThreadId).pipe(Effect.orElseSucceed(() => null))
+      ).pipe(
+        Effect.map((sender) => ({
+          label: automaticDigestLabel(message, sender?.title),
+          at: message.createdAt,
+          text: message.text,
+          digestMessages: message.automaticDigest?.messages,
+        })),
+      ),
+    );
+    const digest = automaticDigest(items);
+    const {
+      senderThreadId: _sender,
+      linkedSender: _linkedSender,
+      scheduledTaskId: _scheduledTask,
+      ...headFields
+    } = headMessage;
+    const events: Array<Omit<OrchestrationV2DomainEvent, "id">> = [];
+    for (const run of absorbed) {
+      events.push(...queuedRunCancellationEvents(projection, run, now));
+      const message = messageOf(run)!;
+      events.push({
+        type: "message.updated",
+        threadId: head.threadId,
+        runId: head.id,
+        ...(head.rootNodeId === null ? {} : { nodeId: head.rootNodeId }),
+        providerInstanceId: head.providerInstanceId,
+        occurredAt: now,
+        payload: { ...message, runId: head.id, nodeId: head.rootNodeId, updatedAt: now },
+      });
+    }
+    const { notification: headNotification, ...headContent } = headFields;
+    const onlyPullRequestWakes = messages.every(
+      (message) => message.notification?.source.kind === "monitor",
+    );
+    const message: OrchestrationV2ConversationMessage = {
+      ...headContent,
+      // No single sender: the digest names each one, and the note would credit only the first.
+      createdBy: "agent",
+      creationSource: "server",
+      text: digest.text,
+      automaticDigest: { messages: digest.messages },
+      // A notice reads as background activity, which a digest of reports and prompts is not.
+      // Without pull request stamps, one outdated wake cannot cancel the others.
+      ...(headNotification !== undefined && onlyPullRequestWakes
+        ? {
+            notification: {
+              ...headNotification,
+              source: { kind: "monitor" as const },
+              summary: `${digest.messages} pull request updates`,
+            },
+          }
+        : {}),
+      updatedAt: now,
+    };
+    events.push({
+      type: "message.updated",
+      threadId: head.threadId,
+      runId: head.id,
+      ...(head.rootNodeId === null ? {} : { nodeId: head.rootNodeId }),
+      providerInstanceId: head.providerInstanceId,
+      occurredAt: now,
+      payload: message,
+    });
+    return { events, message };
+  });
+
   const startNextQueuedRunOnce = Effect.fn("Orchestrator.startNextQueuedRun")(
     function* (
       threadId: ThreadId,
@@ -2667,6 +2806,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
 
       const now = yield* DateTime.now;
+      // Automatic messages that piled up behind a busy turn cost one turn, not one each. The fold
+      // commits with the start below, so a hold or a failed start leaves every message queued.
+      const fold =
+        options?.queuedRunId === undefined
+          ? yield* foldAutomaticRuns(
+              projection,
+              storedQueuedRun,
+              automaticRunsBehind(projection, storedQueuedRun),
+              now,
+            )
+          : undefined;
+      const deliveredMessage = fold?.message ?? queuedMessage;
       const targetAdapter = yield* providerAdapters.get(queuedRun.providerInstanceId).pipe(
         Effect.mapError(
           (cause) =>
@@ -2677,14 +2828,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
-      const followsCurrent = followsCurrentConversation(queuedMessage);
+      const followsCurrent = followsCurrentConversation(deliveredMessage);
       const freshContext = queuedRun.freshContext === true;
       // A scheduled fresh run is a side conversation, so it must not drop the fork's context.
       const supersededForkTransfer =
-        freshContext && queuedMessage.scheduledTaskId === undefined
+        freshContext && deliveredMessage.scheduledTaskId === undefined
           ? pendingForkTransferForThread(projection)
           : undefined;
-      const activeProviderThread = dispatchProviderThread(projection, queuedMessage, freshContext);
+      const activeProviderThread = dispatchProviderThread(
+        projection,
+        deliveredMessage,
+        freshContext,
+      );
       const contextBoundary = freshContext ? ordinal : contextBoundaryOrdinal(projection);
       // A run queued before a fresh run started is bound to the conversation that run left behind.
       const followsLatestContext =
@@ -3043,11 +3198,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ...wakeWorkStartedAt(
           projection,
           {
-            createdBy: queuedMessage.createdBy,
-            creationSource: queuedMessage.creationSource,
-            senderThreadId: queuedMessage.senderThreadId,
-            notification: queuedMessage.notification,
-            delegatedCompletion: queuedMessage.delegatedCompletion,
+            createdBy: deliveredMessage.createdBy,
+            creationSource: deliveredMessage.creationSource,
+            senderThreadId: deliveredMessage.senderThreadId,
+            notification: deliveredMessage.notification,
+            delegatedCompletion: deliveredMessage.delegatedCompletion,
             restartContinuationOfRunId: queuedRun.restartContinuationOfRunId,
           },
           queueDelivery,
@@ -3055,7 +3210,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       };
       const userTurnItem: OrchestrationV2TurnItem = {
         ...(legacyQueuedTurnItem ?? {
-          id: idAllocator.derive.userTurnItem({ messageId: queuedMessage.id }),
+          id: idAllocator.derive.userTurnItem({ messageId: deliveredMessage.id }),
           threadId,
           runId: queuedRun.id,
           nodeId: rootNodeId,
@@ -3067,24 +3222,24 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           status: "completed",
           title: null,
           type: "user_message",
-          messageId: queuedMessage.id,
-          text: queuedMessage.text,
-          attachments: queuedMessage.attachments,
-          ...(queuedMessage.context ? { context: queuedMessage.context } : {}),
-          createdBy: queuedMessage.createdBy,
-          creationSource: queuedMessage.creationSource,
-          ...(queuedMessage.scheduledTaskId === undefined
+          messageId: deliveredMessage.id,
+          text: deliveredMessage.text,
+          attachments: deliveredMessage.attachments,
+          ...(deliveredMessage.context ? { context: deliveredMessage.context } : {}),
+          createdBy: deliveredMessage.createdBy,
+          creationSource: deliveredMessage.creationSource,
+          ...(deliveredMessage.scheduledTaskId === undefined
             ? {}
-            : { scheduledTaskId: queuedMessage.scheduledTaskId }),
-          ...(queuedMessage.senderThreadId === undefined
+            : { scheduledTaskId: deliveredMessage.scheduledTaskId }),
+          ...(deliveredMessage.senderThreadId === undefined
             ? {}
-            : { senderThreadId: queuedMessage.senderThreadId }),
-          ...(queuedMessage.linkedSender === undefined
+            : { senderThreadId: deliveredMessage.senderThreadId }),
+          ...(deliveredMessage.linkedSender === undefined
             ? {}
-            : { linkedSender: queuedMessage.linkedSender }),
-          ...(queuedMessage.idleCompaction === undefined
+            : { linkedSender: deliveredMessage.linkedSender }),
+          ...(deliveredMessage.idleCompaction === undefined
             ? {}
-            : { idleCompaction: queuedMessage.idleCompaction }),
+            : { idleCompaction: deliveredMessage.idleCompaction }),
         }),
         ...(freshContext ? { freshContext: true } : {}),
         providerThreadId: queuedProviderThread.id,
@@ -3183,6 +3338,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : "Provider or model selection changed.";
       yield* writeSystemEvents(
         [
+          ...(fold?.events ?? []),
           ...(selectionChanged
             ? [
                 {
@@ -3231,7 +3387,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                         : ("delta_context" as const),
                       contextHandoffId: handoff.id,
                     },
-                    createdBy: queuedMessage.createdBy,
+                    createdBy: deliveredMessage.createdBy,
                     error: null,
                     createdAt: now,
                     updatedAt: now,
@@ -3311,8 +3467,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             occurredAt: now,
             payload: notificationTurnItem(
               userTurnItem,
-              queuedMessage,
-              yield* notificationTasks(threadId, queuedMessage, projection.subagents),
+              deliveredMessage,
+              yield* notificationTasks(threadId, deliveredMessage, projection.subagents),
             ),
           },
           {
