@@ -7614,6 +7614,57 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("folds the oldest waiting automatic messages past twenty into one", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId } = yield* createWatchedThread("cap");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}-active`),
+        threadId,
+        messageId: MessageId.make(`${threadId}-active`),
+        text: "Active work",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      for (let index = 0; index < 22; index += 1) {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "agent",
+          creationSource: "mcp",
+          senderThreadId: ThreadId.make(`cap-worker-${index}`),
+          commandId: CommandId.make(`${threadId}-report-${index}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}-report-${index}`),
+          text: `Report ${index}.`,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: "queue_after_active" },
+        });
+      }
+      const before = yield* orchestrator.getThreadProjection(threadId);
+      const queued = before.runs.filter((run) => run.status === "queued");
+      assert.lengthOf(queued, 20);
+      const summary = before.messages.find(
+        (message) => message.id === MessageId.make(`${threadId}-report-0`),
+      );
+      assert.deepEqual(summary?.automaticDigest, { messages: 3 });
+      for (const report of ["Report 0.", "Report 1.", "Report 2."]) {
+        assert.include(summary?.text ?? "", report);
+      }
+
+      const after = yield* finishActiveRun(threadId);
+      const delivered = after.messages.find((message) => message.id === summary?.id);
+      assert.equal(after.runs.find((run) => run.userMessageId === summary?.id)?.status, "starting");
+      assert.deepEqual(delivered?.automaticDigest, { messages: 22 });
+      assert.lengthOf(delivered?.text.match(/automatic messages arrived/g) ?? [], 1);
+      assert.include(delivered?.text ?? "", "Report 21.");
+    }),
+  );
+
   it.effect("runs a typed message before automatic messages queued ahead of it", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

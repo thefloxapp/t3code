@@ -199,6 +199,7 @@ import {
   automaticDigest,
   automaticDigestLabel,
   isFoldableAutomaticMessage,
+  AUTOMATIC_QUEUE_LIMIT,
   isUserTypedMessage,
   sameAutomaticKey,
 } from "./AutomaticDelivery.ts";
@@ -2669,47 +2670,93 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const waitingRuns = projection.runs
       .filter((candidate) => candidate.status === "queued")
       .toSorted((left, right) => left.ordinal - right.ordinal);
-    if (
-      origin?.key == null ||
-      waitingRuns.length === 0 ||
-      !isFoldableAutomaticMessage(incoming, { ...run, queueHeld: false })
-    ) {
-      return unchanged;
-    }
+    if (origin === undefined || waitingRuns.length === 0) return unchanged;
     const waitingMessages = yield* projectionStore
       .getMessagesById(
         projection.thread.id,
         waitingRuns.map((waiting) => waiting.userMessageId),
       )
       .pipe(mapDispatchError(input.command));
+    const records = {
+      thread: projection.thread,
+      runs: waitingRuns,
+      messages: [...waitingMessages.values()],
+    };
     const selection = modelSelectionKey(
       followsCurrentConversation(incoming) ? projection.thread.modelSelection : run.modelSelection,
     );
-    const replaced = waitingRuns.flatMap((waiting) => {
-      const message = waitingMessages.get(waiting.userMessageId);
-      return message !== undefined &&
-        sameAutomaticKey(origin, automaticDeliveryOrigin(message)) &&
-        isFoldableAutomaticMessage(message, { ...waiting, queueHeld: false }) &&
-        modelSelectionKey(
-          queuedRunModelSelection({ thread: projection.thread, messages: [message] }, waiting),
-        ) === selection &&
-        (origin.kind !== "scheduled_task" || message.text === incoming.text)
-        ? [{ run: waiting, message }]
-        : [];
-    });
-    if (replaced.length === 0) return unchanged;
+    const replaced =
+      origin.key === null || !isFoldableAutomaticMessage(incoming, { ...run, queueHeld: false })
+        ? []
+        : waitingRuns.flatMap((waiting) => {
+            const message = waitingMessages.get(waiting.userMessageId);
+            return message !== undefined &&
+              sameAutomaticKey(origin, automaticDeliveryOrigin(message)) &&
+              isFoldableAutomaticMessage(message, { ...waiting, queueHeld: false }) &&
+              modelSelectionKey(queuedRunModelSelection(records, waiting)) === selection &&
+              (origin.kind !== "scheduled_task" || message.text === incoming.text)
+              ? [{ run: waiting, message }]
+              : [];
+          });
     const merged =
-      origin.kind === "pull_request"
+      origin.kind === "pull_request" && replaced.length > 0
         ? mergedPullRequestWakes([...replaced.map(({ message }) => message), incoming])
         : unchanged;
-    if (merged === undefined) return unchanged;
+    const kept = merged === undefined ? [] : replaced;
+    const replacedIds = new Set(kept.map(({ run: waiting }) => waiting.id));
+    const capped = yield* foldAutomaticPastLimit(
+      { ...records, runs: waitingRuns.filter((waiting) => !replacedIds.has(waiting.id)) },
+      projection,
+      now,
+    );
     return {
-      text: merged.text,
-      notification: merged.notification,
-      events: replaced.flatMap(({ run: waiting }) =>
-        queuedRunCancellationEvents(projection, waiting, now),
-      ),
+      text: merged?.text ?? incoming.text,
+      notification: merged === undefined ? incoming.notification : merged.notification,
+      events: [
+        ...kept.flatMap(({ run: waiting }) =>
+          queuedRunCancellationEvents(projection, waiting, now),
+        ),
+        ...capped,
+      ],
     };
+  });
+
+  /**
+   * Past the limit, the oldest waiting automatic messages fold into one, so a busy thread holds
+   * at most `AUTOMATIC_QUEUE_LIMIT` of them, counting the one being queued.
+   */
+  const foldAutomaticPastLimit = Effect.fnUntraced(function* (
+    records: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "messages">,
+    projection: Pick<OrchestrationV2ThreadProjection, "nodes" | "attempts">,
+    now: DateTime.Utc,
+  ) {
+    const messages = new Map(records.messages.map((message) => [message.id, message]));
+    const automatic = queuedRunsInDeliveryOrder(records).filter((waiting) => {
+      const message = messages.get(waiting.userMessageId);
+      return message !== undefined && automaticDeliveryOrigin(message) !== undefined;
+    });
+    const excess = automatic.length + 1 - AUTOMATIC_QUEUE_LIMIT;
+    if (excess <= 0) return [];
+    const foldable = automatic.filter(
+      (waiting) => foldableQueuedMessage(records, { ...waiting, queueHeld: false }) !== undefined,
+    );
+    const [head, ...rest] = foldable;
+    if (head === undefined) return [];
+    const selection = modelSelectionKey(queuedRunModelSelection(records, head));
+    const absorbed = rest
+      .filter(
+        (waiting) =>
+          waiting.queueHeld === head.queueHeld &&
+          modelSelectionKey(queuedRunModelSelection(records, waiting)) === selection,
+      )
+      .slice(0, excess);
+    const fold = yield* foldAutomaticRuns(
+      { messages: records.messages, nodes: projection.nodes, attempts: projection.attempts },
+      head,
+      absorbed,
+      now,
+    );
+    return fold?.events ?? [];
   });
 
   /** The queue position of the automatic messages at the end of the queue, if it ends with any. */

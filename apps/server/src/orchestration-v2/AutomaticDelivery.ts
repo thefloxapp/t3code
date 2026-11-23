@@ -27,6 +27,9 @@ type OriginFields = Pick<
   | "automaticDigest"
 >;
 
+/** Waiting automatic messages a thread keeps before the oldest fold into one. */
+export const AUTOMATIC_QUEUE_LIMIT = 20;
+
 /** Stamps are normalized when the watch sync dispatches them. */
 const pullRequestKey = (key: ThreadPullRequestKey) => `${key.host}/${key.repository}#${key.number}`;
 
