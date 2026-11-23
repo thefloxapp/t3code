@@ -454,6 +454,11 @@ The target runtime and interaction modes may not be broader than the caller's.
 Stable command and message IDs are derived from `clientRequestId` for
 idempotent retries.
 
+A queued send from another thread is an automatic message: a newer queued send
+from the same thread replaces it, and several automatic messages waiting behind
+a busy turn arrive as one turn. See
+[automatic messages on a busy thread](feature-lifecycles.md#automatic-messages-on-a-busy-thread).
+
 ### `t3_thread_wait`
 
 Waits for a selected run to become `completed`, `failed`, `cancelled`,

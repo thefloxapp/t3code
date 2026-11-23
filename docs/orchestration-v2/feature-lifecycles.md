@@ -115,6 +115,39 @@ type RunAttempt = {
 
 Only the selected/final attempt completes the run and creates the run checkpoint. Earlier interrupted steering attempts remain in the execution graph for audit/debugging.
 
+### Automatic messages on a busy thread
+
+An orchestrator thread can receive automatic messages faster than its turns end: progress reports
+from worker threads (`t3_thread_send` with a sender thread), pull request watch wakes, and scheduled
+task prompts. One queued turn each let a busy thread fall hours behind and starve its user. The
+queue owner in `Orchestrator.ts` handles them in four places, with no extra scheduler:
+
+- **Origin.** `AutomaticDelivery.ts` derives a typed origin and key from stored message fields: a
+  pull request by host, repository and number, a scheduled task by id, an agent send by its sender
+  thread. Typed messages, delegated results, provider notices and tool sends without a sender are
+  not automatic and keep their old behavior.
+- **Latest wins, at enqueue.** A newly queued automatic message cancels waiting ones with the same
+  key. Pull request wakes list only what changed since the last wake, so a waiting wake merges into
+  the new one instead. Each part keeps its own stamp and section, and `currentPullRequestWatchWake`
+  drops only the parts a push, merge, close or unwatch outdates. Scheduled prompts replace only an
+  identical prompt, so webhook payloads survive.
+- **User first, at enqueue.** A typed message takes the queue position of the automatic messages at
+  the end of the queue. It is a stored position, so a person can still reorder the queue.
+- **Digest, at start.** When the next run is automatic, it absorbs the automatic runs directly
+  behind it. The provider reads one prompt listing each message with its sender, time and text.
+  Absorbed runs are cancelled and their messages move to the delivering run. The fold is part of
+  the same write as the start, so a held queue or a failed start leaves every message queued.
+- **Cap, at enqueue.** Past `AUTOMATIC_QUEUE_LIMIT` (20) waiting automatic messages, the oldest fold
+  into one summary with the same digest.
+
+A run is never folded or replaced when cancelling it would change more than its prompt: attachments,
+a leading command, fresh context, a different model, or a delegated task, continuation or plan it
+carries. A digest has no single sender, so it drops the sender fields and the sender note.
+
+Known costs: `t3_thread_wait` on a folded or replaced run reports `cancelled`. A scheduled task
+folded into another run no longer records that run's outcome. A queued summary from the cap carries
+no pull request stamps, so its pull request parts are not revalidated before delivery.
+
 ## Follow-Up Turns
 
 A normal follow-up after a completed run creates a new run.
