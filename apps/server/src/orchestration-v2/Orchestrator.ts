@@ -195,9 +195,11 @@ import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import {
+  automaticDeliveryOrigin,
   automaticDigest,
   automaticDigestLabel,
   isFoldableAutomaticMessage,
+  sameAutomaticKey,
 } from "./AutomaticDelivery.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
 import {
@@ -1216,6 +1218,55 @@ function currentPullRequestWatchWake(
 
 function withoutSection({ section: _, ...stamp }: MonitorPullRequestStamp) {
   return stamp;
+}
+
+/**
+ * Updates for one pull request as one wake. Each keeps its own stamp and section, so a push
+ * or merge drops only the parts it outdates before the wake starts.
+ */
+function mergedPullRequestWakes(
+  wakes: ReadonlyArray<Pick<OrchestrationV2ConversationMessage, "text" | "notification">>,
+): { readonly text: string; readonly notification: OrchestrationV2Notification } | undefined {
+  const stamps: Array<MonitorPullRequestStamp> = [];
+  for (const wake of wakes) {
+    const own = monitorPullRequestStamps(wake.notification?.source);
+    const [only] = own;
+    if (wake.notification === undefined || only === undefined) return undefined;
+    if (own.length === 1 && only.section === undefined) {
+      const { text } = wake;
+      const { outcome, summary } = wake.notification;
+      stamps.push({ ...only, section: { text, outcome, summary } });
+    } else if (own.every((stamp) => stamp.section !== undefined)) {
+      stamps.push(...own);
+    } else {
+      return undefined;
+    }
+  }
+  const [first, ...rest] = stamps;
+  if (first === undefined) return undefined;
+  const wake = combinePullRequestWatchWakes(
+    stamps.flatMap(({ section }) =>
+      section === undefined
+        ? []
+        : [
+            {
+              text: section.text,
+              notification: {
+                source: { kind: "monitor" as const },
+                outcome: section.outcome,
+                summary: section.summary,
+              },
+            },
+          ],
+    ) as [PullRequestWatchWake, ...Array<PullRequestWatchWake>],
+  );
+  return {
+    text: wake.text,
+    notification: {
+      ...wake.notification,
+      source: { kind: "monitor", pullRequest: first, otherPullRequests: rest },
+    },
+  };
 }
 
 const modelSelectionKey = (selection: ModelSelection) =>
@@ -2591,6 +2642,75 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return { events, message };
   });
 
+  /**
+   * Latest wins: a newer automatic message cancels the waiting ones from the same source. Pull
+   * request updates list only what is new, so the waiting ones merge into it instead. Scheduled
+   * prompts replace only an identical prompt; a webhook's payload is its own news.
+   */
+  const replaceWaitingAutomatic = Effect.fnUntraced(function* (input: {
+    readonly command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
+    readonly projection: Pick<
+      OrchestrationV2ThreadProjection,
+      "thread" | "runs" | "nodes" | "attempts"
+    >;
+    readonly run: OrchestrationV2Run;
+    readonly incoming: Parameters<typeof isFoldableAutomaticMessage>[0] &
+      Pick<OrchestrationV2ConversationMessage, "followsThreadSelection">;
+    readonly now: DateTime.Utc;
+  }) {
+    const { incoming, projection, run, now } = input;
+    const unchanged = {
+      text: incoming.text,
+      notification: incoming.notification,
+      events: [] as ReadonlyArray<Omit<OrchestrationV2DomainEvent, "id">>,
+    };
+    const origin = automaticDeliveryOrigin(incoming);
+    const waitingRuns = projection.runs
+      .filter((candidate) => candidate.status === "queued")
+      .toSorted((left, right) => left.ordinal - right.ordinal);
+    if (
+      origin?.key == null ||
+      waitingRuns.length === 0 ||
+      !isFoldableAutomaticMessage(incoming, { ...run, queueHeld: false })
+    ) {
+      return unchanged;
+    }
+    const waitingMessages = yield* projectionStore
+      .getMessagesById(
+        projection.thread.id,
+        waitingRuns.map((waiting) => waiting.userMessageId),
+      )
+      .pipe(mapDispatchError(input.command));
+    const selection = modelSelectionKey(
+      followsCurrentConversation(incoming) ? projection.thread.modelSelection : run.modelSelection,
+    );
+    const replaced = waitingRuns.flatMap((waiting) => {
+      const message = waitingMessages.get(waiting.userMessageId);
+      return message !== undefined &&
+        sameAutomaticKey(origin, automaticDeliveryOrigin(message)) &&
+        isFoldableAutomaticMessage(message, { ...waiting, queueHeld: false }) &&
+        modelSelectionKey(
+          queuedRunModelSelection({ thread: projection.thread, messages: [message] }, waiting),
+        ) === selection &&
+        (origin.kind !== "scheduled_task" || message.text === incoming.text)
+        ? [{ run: waiting, message }]
+        : [];
+    });
+    if (replaced.length === 0) return unchanged;
+    const merged =
+      origin.kind === "pull_request"
+        ? mergedPullRequestWakes([...replaced.map(({ message }) => message), incoming])
+        : unchanged;
+    if (merged === undefined) return unchanged;
+    return {
+      text: merged.text,
+      notification: merged.notification,
+      events: replaced.flatMap(({ run: waiting }) =>
+        queuedRunCancellationEvents(projection, waiting, now),
+      ),
+    };
+  });
+
   const startNextQueuedRunOnce = Effect.fn("Orchestrator.startNextQueuedRun")(
     function* (
       threadId: ThreadId,
@@ -2616,22 +2736,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (yield* cancelStaleQuestionWakes(projection)) {
         projection = yield* readCommandProjection(threadId);
       }
+      // Every outdated pull request wake leaves the queue, not only the next one, so none
+      // holds a place, splits a digest, or outlives its pull request behind a long queue.
+      const staleWakes = projection.runs.filter(
+        (run) => run.status === "queued" && isStalePullRequestWatchWake(projection, run),
+      );
+      if (staleWakes.length > 0) {
+        const now = yield* DateTime.now;
+        yield* writeSystemEvents(
+          staleWakes.flatMap((run) => queuedRunCancellationEvents(projection, run, now)),
+        );
+        projection = yield* readCommandProjection(threadId);
+      }
       let storedQueuedRun =
-        options?.queuedRunId === undefined
+        options?.queuedRunId === undefined ||
+        staleWakes.some((run) => run.id === options.queuedRunId)
           ? nextQueuedRun(projection)
           : projection.runs.find(
               (run) => run.id === options.queuedRunId && run.status === "queued",
             );
-      while (
-        storedQueuedRun !== undefined &&
-        isStalePullRequestWatchWake(projection, storedQueuedRun)
-      ) {
-        yield* writeSystemEvents(
-          queuedRunCancellationEvents(projection, storedQueuedRun, yield* DateTime.now),
-        );
-        projection = yield* readCommandProjection(threadId);
-        storedQueuedRun = nextQueuedRun(projection);
-      }
       // A wake that outlived some of its pull requests tells only the current ones.
       const currentWake =
         storedQueuedRun === undefined
@@ -8244,6 +8367,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         startedAt: null,
         completedAt: null,
       };
+      const latest = yield* replaceWaitingAutomatic({
+        command,
+        projection,
+        run,
+        incoming: {
+          ...command,
+          delegatedCompletion,
+          notification,
+          text: dispatchText,
+          ...(command.scheduledTaskId !== undefined && command.modelSelection === undefined
+            ? { followsThreadSelection: true as const }
+            : {}),
+        },
+        now,
+      });
       const message: OrchestrationV2ConversationMessage = {
         createdBy: command.createdBy,
         creationSource: command.creationSource,
@@ -8261,16 +8399,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         runId,
         nodeId: rootNodeId,
         role: "user",
-        text: dispatchText,
+        text: latest.text,
         ...(command.context ? { context: command.context } : {}),
         attachments: command.attachments,
         streaming: false,
         createdAt: now,
         updatedAt: now,
         ...(delegatedCompletion === undefined ? {} : { delegatedCompletion }),
-        ...(notification === undefined ? {} : { notification }),
+        ...(latest.notification === undefined ? {} : { notification: latest.notification }),
       };
       const emitEvent = emit(events, command);
+      for (const event of latest.events) yield* emitEvent(event);
       if (targetProviderThread === undefined) {
         yield* emitEvent({
           type: "provider-thread.updated",

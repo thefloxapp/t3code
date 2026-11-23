@@ -44,9 +44,13 @@ export function automaticDeliveryOrigin(
     ) {
       return undefined;
     }
+    // A wake that merged several updates for one pull request is still that pull request's.
+    const key = pullRequestKey(source.pullRequest);
     return {
       kind: "pull_request",
-      key: (source.otherPullRequests?.length ?? 0) > 0 ? null : pullRequestKey(source.pullRequest),
+      key: (source.otherPullRequests ?? []).every((other) => pullRequestKey(other) === key)
+        ? key
+        : null,
     };
   }
   if (message.scheduledTaskId !== undefined) {
@@ -62,6 +66,19 @@ export function automaticDeliveryOrigin(
   return message.senderThreadId === undefined
     ? undefined
     : { kind: "agent_send", key: message.senderThreadId };
+}
+
+export function sameAutomaticKey(
+  left: AutomaticDeliveryOrigin | undefined,
+  right: AutomaticDeliveryOrigin | undefined,
+): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.key !== null &&
+    left.kind === right.kind &&
+    left.key === right.key
+  );
 }
 
 /** Text the provider reads as a command, which a digest would turn into prose. */

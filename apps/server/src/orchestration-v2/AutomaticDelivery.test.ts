@@ -33,6 +33,11 @@ describe("automatic delivery origin", () => {
     ["pull request wake", wake(7), { kind: "pull_request", key: "github.com/acme/app#7" }],
     ["wake covering two pull requests", wake(7, 8), { kind: "pull_request", key: null }],
     [
+      "two updates merged for one pull request",
+      wake(7, 7),
+      { kind: "pull_request", key: "github.com/acme/app#7" },
+    ],
+    [
       "scheduled task a user created",
       { createdBy: "user", creationSource: "web", scheduledTaskId: "task:1" },
       { kind: "scheduled_task", key: "task:1" },

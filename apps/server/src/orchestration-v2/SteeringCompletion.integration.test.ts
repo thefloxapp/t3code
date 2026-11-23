@@ -1815,24 +1815,21 @@ it.effect("delivers agent messages queued behind /compact before a later one ste
         });
       yield* sendFromAgent("ALPHA");
       yield* sendFromAgent("BRAVO");
+      // The newer send from the same thread replaces the one still waiting.
       const queued = (yield* orchestrator.getThreadProjection(threadId)).runs.filter(
         (run) => run.status === "queued",
       );
-      assert.lengthOf(queued, 2);
+      assert.lengthOf(queued, 1);
       assert.deepEqual(steered, []);
 
-      const alphaRunning = yield* nextRunning();
+      const bravoRunning = yield* nextRunning();
       yield* finishTurn(1);
-      yield* Fiber.join(alphaRunning);
+      yield* Fiber.join(bravoRunning);
       yield* lock;
       assert.deepEqual(
-        started.slice(0, 2).map((turn) => turn.message.text.split("\n").at(-1)),
-        ["first", "/compact"],
+        started.map((turn) => turn.message.text.split("\n").at(-1)),
+        ["first", "/compact", "BRAVO"],
       );
-      // Both queued sends reach the agent in one turn, in send order.
-      const digest = started[2]?.message.text ?? "";
-      assert.isAbove(digest.indexOf("ALPHA"), -1);
-      assert.isBelow(digest.indexOf("ALPHA"), digest.indexOf("BRAVO"));
 
       yield* sendFromAgent("CHARLIE");
       const delivered = [...steered, ...started.slice(3).map((turn) => turn.message.text)]

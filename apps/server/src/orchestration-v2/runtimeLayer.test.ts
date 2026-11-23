@@ -7349,15 +7349,24 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         Stream.runDrain,
       );
       const after = yield* orchestrator.getThreadProjection(threadId);
+      // The final notice for the same pull request takes the queued wake's news with it.
+      const merged = mode === "comment limit";
       assert.equal(
         after.runs.find((run) => run.id === wakeRun.id)?.status,
-        deliverable ? "starting" : "cancelled",
+        deliverable && !merged ? "starting" : "cancelled",
       );
       assert.equal(
         after.runs.find((run) => run.id === userRun.id)?.status,
-        deliverable ? "queued" : "starting",
+        deliverable && !merged ? "queued" : "starting",
       );
-      if (!deliverable) {
+      if (merged) {
+        const notice = after.messages.find(
+          (message) => message.id === MessageId.make(`${threadId}-exhausted`),
+        );
+        assert.include(notice?.text ?? "", "Checks failed");
+        assert.equal(after.runs.find((run) => run.userMessageId === notice?.id)?.status, "queued");
+      }
+      if (!deliverable || merged) {
         assert.equal(
           after.attempts.find((attempt) => attempt.id === wakeRun.activeAttemptId)?.status,
           "cancelled",
@@ -7539,6 +7548,118 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           .map((message) => message.runId),
         [digestRun?.id ?? null, digestRun?.id ?? null],
       );
+    }),
+  );
+
+  it.effect("keeps only the newest waiting automatic message per sender and task", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId } = yield* createWatchedThread("latest");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}-active`),
+        threadId,
+        messageId: MessageId.make(`${threadId}-active`),
+        text: "Active work",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const queue = (
+        id: string,
+        text: string,
+        from: { readonly senderThreadId: ThreadId } | { readonly scheduledTaskId: ScheduledTaskId },
+      ) =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          ...("senderThreadId" in from
+            ? { createdBy: "agent", creationSource: "mcp", modelSelection, ...from }
+            : { createdBy: "user", creationSource: "web", ...from }),
+          commandId: CommandId.make(`${threadId}-${id}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}-${id}`),
+          text,
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+        });
+      const worker = { senderThreadId: ThreadId.make("latest-worker") };
+      const heartbeat = { scheduledTaskId: ScheduledTaskId.make("latest-heartbeat") };
+      const webhook = { scheduledTaskId: ScheduledTaskId.make("latest-webhook") };
+      yield* queue("report-1", "Build started.", worker);
+      yield* queue("beat-1", "Check the workers.", heartbeat);
+      yield* queue("hook-1", "Push to main.", webhook);
+      yield* queue("report-2", "Build passed.", worker);
+      yield* queue("beat-2", "Check the workers.", heartbeat);
+      // Webhook prompts carry their own payloads, so neither replaces the other.
+      yield* queue("hook-2", "Push to release.", webhook);
+
+      const after = yield* orchestrator.getThreadProjection(threadId);
+      const statusOf = (id: string) =>
+        after.runs.find((run) => run.userMessageId === MessageId.make(`${threadId}-${id}`))?.status;
+      assert.deepEqual(
+        ["report-1", "beat-1", "hook-1", "report-2", "beat-2", "hook-2"].map(statusOf),
+        ["cancelled", "cancelled", "queued", "queued", "queued", "queued"],
+      );
+    }),
+  );
+
+  it.effect("merges a newer pull request update into the waiting one, part by part", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId, key, watch } = yield* createWatchedThread("merge");
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        createdBy: "user",
+        creationSource: "web",
+        commandId: CommandId.make(`${threadId}-active`),
+        threadId,
+        messageId: MessageId.make(`${threadId}-active`),
+        text: "Active work",
+        attachments: [],
+        modelSelection,
+        dispatchMode: { type: "start_immediately" },
+      });
+      const recordedWatch = { ...watch, headSha: "abc123", wakes: 1 };
+      const sync = (id: string, text: string, summary: string, includesRemarks = false) =>
+        orchestrator.dispatch({
+          type: "thread.pull-request-watch.sync",
+          commandId: CommandId.make(`${threadId}-${id}`),
+          threadId,
+          ...key,
+          startedAt: watch.startedAt,
+          watch: recordedWatch,
+          wake: {
+            messageId: MessageId.make(`${threadId}-${id}`),
+            text,
+            notification: { source: { kind: "monitor" }, outcome: "updated", summary },
+            ...(includesRemarks ? { includesRemarks: true } : {}),
+          },
+        });
+      yield* sync("checks", "Checks failed on abc123.", "#7: checks failed");
+      yield* sync("comments", "2 new comments: please rename.", "#7: new comments", true);
+
+      const queued = (yield* orchestrator.getThreadProjection(threadId)).runs.filter(
+        (run) => run.status === "queued",
+      );
+      assert.lengthOf(queued, 1);
+      // A push outdates the check failure but not the review comments.
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request-watch.sync",
+        commandId: CommandId.make(`${threadId}-push`),
+        threadId,
+        ...key,
+        startedAt: watch.startedAt,
+        watch: { ...recordedWatch, headSha: "def456" },
+      });
+
+      const after = yield* finishActiveRun(threadId);
+      const started = after.runs.find((run) => run.id === queued[0]!.id);
+      assert.equal(started?.status, "starting");
+      const text = after.messages.find((message) => message.id === started?.userMessageId)?.text;
+      assert.include(text ?? "", "please rename");
+      assert.notInclude(text ?? "", "Checks failed");
     }),
   );
 
