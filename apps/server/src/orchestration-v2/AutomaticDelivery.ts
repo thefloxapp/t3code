@@ -81,6 +81,21 @@ export function sameAutomaticKey(
   );
 }
 
+/** A message a person typed, which never waits behind automatic ones and is never folded. */
+export function isUserTypedMessage(
+  message: Pick<
+    OrchestrationV2ConversationMessage,
+    "createdBy" | "scheduledTaskId" | "notification" | "delegatedCompletion"
+  >,
+): boolean {
+  return (
+    message.createdBy === "user" &&
+    message.scheduledTaskId === undefined &&
+    message.notification === undefined &&
+    message.delegatedCompletion === undefined
+  );
+}
+
 /** Text the provider reads as a command, which a digest would turn into prose. */
 const LEADING_COMMAND = /^\s*[/$]/u;
 

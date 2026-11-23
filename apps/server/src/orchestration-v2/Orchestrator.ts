@@ -199,6 +199,7 @@ import {
   automaticDigest,
   automaticDigestLabel,
   isFoldableAutomaticMessage,
+  isUserTypedMessage,
   sameAutomaticKey,
 } from "./AutomaticDelivery.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
@@ -2709,6 +2710,31 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         queuedRunCancellationEvents(projection, waiting, now),
       ),
     };
+  });
+
+  /** The queue position of the automatic messages at the end of the queue, if it ends with any. */
+  const automaticQueueTailPosition = Effect.fnUntraced(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+    projection: Pick<OrchestrationV2ThreadProjection, "runs">,
+  ) {
+    const queued = projection.runs.filter((run) => run.status === "queued");
+    if (queued.length === 0) return undefined;
+    const messages = yield* projectionStore
+      .getMessagesById(
+        command.threadId,
+        queued.map((run) => run.userMessageId),
+      )
+      .pipe(mapDispatchError(command));
+    const order = queuedRunsInDeliveryOrder({ runs: queued, messages: [...messages.values()] });
+    let tail: number | undefined;
+    for (const run of order.toReversed()) {
+      const message = messages.get(run.userMessageId);
+      // Delegated completions keep their own order beside messages, so they end nothing here.
+      if (message?.delegatedCompletion !== undefined) continue;
+      if (message === undefined || automaticDeliveryOrigin(message) === undefined) break;
+      tail = Math.min(tail ?? Number.POSITIVE_INFINITY, run.queuePosition ?? run.ordinal);
+    }
+    return tail;
   });
 
   const startNextQueuedRunOnce = Effect.fn("Orchestrator.startNextQueuedRun")(
@@ -8288,6 +8314,15 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               .map((candidate) => candidate.queuePosition ?? candidate.ordinal),
           ) + 1;
       }
+      // A typed message waits behind earlier typed ones, never behind automatic ones. It takes a
+      // real queue position, so a person can still reorder the queue afterwards.
+      const userFirstQueuePosition =
+        queuedRunStop === undefined &&
+        steerFollowUpQueuePosition === undefined &&
+        isUserTypedMessage({ ...command, delegatedCompletion, notification })
+          ? yield* automaticQueueTailPosition(command, projection)
+          : undefined;
+      const insertedQueuePosition = steerFollowUpQueuePosition ?? userFirstQueuePosition;
       const run: OrchestrationV2Run = {
         id: runId,
         threadId: command.threadId,
@@ -8312,7 +8347,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         queuePosition:
           queuedRunStop !== undefined
             ? 1
-            : (steerFollowUpQueuePosition ??
+            : (insertedQueuePosition ??
               Math.max(
                 0,
                 ...projection.runs
@@ -8428,11 +8463,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: run,
       });
-      if (steerFollowUpQueuePosition !== undefined) {
+      if (insertedQueuePosition !== undefined) {
         for (const queued of projection.runs) {
           if (
             queued.status !== "queued" ||
-            (queued.queuePosition ?? queued.ordinal) < steerFollowUpQueuePosition
+            (queued.queuePosition ?? queued.ordinal) < insertedQueuePosition
           )
             continue;
           yield* emitEvent({

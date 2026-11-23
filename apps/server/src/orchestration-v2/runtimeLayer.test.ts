@@ -25,6 +25,7 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
   type OrchestrationV2ShellSnapshot,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2RuntimeRequest,
   ProjectId,
   type PullRequestCheck,
@@ -7200,15 +7201,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
             : {}),
         },
       });
+      // Neither typed nor automatic, so it neither passes the wake nor shares its turn.
       const userMessageId = MessageId.make(`${threadId}-user`);
       yield* orchestrator.dispatch({
         type: "message.dispatch",
-        createdBy: "user",
-        creationSource: "web",
+        createdBy: "agent",
+        creationSource: "mcp",
         commandId: CommandId.make(`${threadId}-user`),
         threadId,
         messageId: userMessageId,
-        text: "User follow-up",
+        text: "Tool follow-up",
         attachments: [],
         modelSelection,
         dispatchMode: { type: "queue_after_active" },
@@ -7511,6 +7513,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         dispatchMode: { type: "queue_after_active" },
       });
 
+      // The typed message goes first; it is never folded in.
+      const typed = yield* finishActiveRun(threadId);
+      assert.deepEqual(
+        [userId, reportId, wakeId, heartbeatId].map(
+          (messageId) => typed.runs.find((run) => run.userMessageId === messageId)?.status,
+        ),
+        ["starting", "queued", "queued", "queued"],
+      );
       const after = yield* finishActiveRun(threadId);
       const runOf = (messageId: MessageId) =>
         after.runs.find((run) => run.userMessageId === messageId);
@@ -7518,7 +7528,6 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(digestRun?.status, "starting");
       assert.equal(runOf(wakeId)?.status, "cancelled");
       assert.equal(runOf(heartbeatId)?.status, "cancelled");
-      assert.equal(runOf(userId)?.status, "queued");
       const digest = after.messages.find((message) => message.id === reportId);
       assert.deepEqual(digest?.automaticDigest, { messages: 3 });
       assert.isUndefined(digest?.senderThreadId);
@@ -7601,6 +7610,54 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.deepEqual(
         ["report-1", "beat-1", "hook-1", "report-2", "beat-2", "hook-2"].map(statusOf),
         ["cancelled", "cancelled", "queued", "queued", "queued", "queued"],
+      );
+    }),
+  );
+
+  it.effect("runs a typed message before automatic messages queued ahead of it", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const { threadId } = yield* createWatchedThread("user-first");
+      const send = (id: string, from: "user" | "agent" | "scheduled", mode: "start" | "queue") =>
+        orchestrator.dispatch({
+          type: "message.dispatch",
+          ...(from === "agent"
+            ? {
+                createdBy: "agent",
+                creationSource: "mcp",
+                senderThreadId: ThreadId.make("user-first-worker"),
+              }
+            : from === "scheduled"
+              ? {
+                  createdBy: "user",
+                  creationSource: "web",
+                  scheduledTaskId: ScheduledTaskId.make("user-first-heartbeat"),
+                }
+              : { createdBy: "user", creationSource: "web" }),
+          commandId: CommandId.make(`${threadId}-${id}`),
+          threadId,
+          messageId: MessageId.make(`${threadId}-${id}`),
+          text: id,
+          attachments: [],
+          modelSelection,
+          dispatchMode: { type: mode === "start" ? "start_immediately" : "queue_after_active" },
+        });
+      yield* send("active", "user", "start");
+      yield* send("first-question", "user", "queue");
+      yield* send("report", "agent", "queue");
+      yield* send("heartbeat", "scheduled", "queue");
+      yield* send("second-question", "user", "queue");
+
+      const statusOf = (projection: OrchestrationV2ThreadProjection, id: string) =>
+        projection.runs.find((run) => run.userMessageId === MessageId.make(`${threadId}-${id}`))
+          ?.status;
+      // An earlier typed message keeps its place; the later one passes only automatic ones.
+      const first = yield* finishActiveRun(threadId);
+      assert.equal(statusOf(first, "first-question"), "starting");
+      const second = yield* finishActiveRun(threadId);
+      assert.deepEqual(
+        ["second-question", "report", "heartbeat"].map((id) => statusOf(second, id)),
+        ["starting", "queued", "queued"],
       );
     }),
   );
